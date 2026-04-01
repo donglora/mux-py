@@ -1,0 +1,22 @@
+[project]
+name = "donglora-mux"
+version = "0.1.0"
+description = "DongLoRa USB Multiplexer — share one dongle with multiple applications"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Stephen Waits" }]
+dependencies = [
+    "donglora",
+    "cobs",
+    "pyserial",
+]
+
+[project.scripts]
+donglora-mux = "donglora_mux:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+donglora = { path = "../../clients/python", editable = true }
