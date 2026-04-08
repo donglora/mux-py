@@ -22,5 +22,5 @@ just run --tcp 5741 --port /dev/ttyACM0   # with options
 
 ## Depends On
 
-- [clients/python](../../clients/python/) — the `donglora` client library
+- [`donglora`](https://github.com/donglora/client-py) — the Python client library
   (protocol encoding, device discovery)
