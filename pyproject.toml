@@ -1,10 +1,19 @@
 [project]
 name = "donglora-mux"
-version = "0.1.0"
+version = "0.2.0"
 description = "DongLoRa USB Multiplexer — share one dongle with multiple applications"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Stephen Waits" }]
+readme = "README.md"
+authors = [{ name = "Stephen Waits", email = "steve@waits.net" }]
+keywords = ["lora", "radio", "usb", "multiplexer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: System :: Hardware",
+]
 dependencies = [
     "donglora",
     "cobs",
@@ -14,12 +23,30 @@ dependencies = [
 [project.scripts]
 donglora-mux = "donglora_mux:main"
 
+[project.urls]
+Repository = "https://github.com/donglora/mux-py"
+Homepage = "https://github.com/donglora/mux-py"
+
 [dependency-groups]
-dev = ["ruff"]
+dev = ["ruff", "pytest", "pytest-cov"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv.sources]
-donglora = { path = "../../clients/python", editable = true }
+donglora = { path = "../client-py", editable = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "ARG", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["donglora", "donglora_mux"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

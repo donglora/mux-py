@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -55,6 +56,7 @@ def default_socket_path() -> str:
 
 
 # ── Per-client state ─────────────────────────────────────────────
+
 
 class Client:
     """Tracks one connected client."""
@@ -93,25 +95,20 @@ class Client:
             self.send_queue.put_nowait(cobs_frame)
         except asyncio.QueueFull:
             # Drop oldest to make room (best-effort for slow clients)
-            try:
+            with contextlib.suppress(asyncio.QueueEmpty):
                 self.send_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
+            with contextlib.suppress(asyncio.QueueFull):
                 self.send_queue.put_nowait(cobs_frame)
-            except asyncio.QueueFull:
-                pass
 
     def close(self) -> None:
         if self._sender_task:
             self._sender_task.cancel()
-        try:
+        with contextlib.suppress(Exception):
             self.writer.close()
-        except Exception:
-            pass
 
 
 # ── Mux daemon ───────────────────────────────────────────────────
+
 
 class MuxDaemon:
     def __init__(self, serial_port: str, socket_path: str, tcp_addr: tuple[str, int] | None = None):
@@ -150,7 +147,11 @@ class MuxDaemon:
             except (serial.SerialException, OSError) as e:
                 consecutive_errors += 1
                 if consecutive_errors >= max_retries:
-                    log.error("Dongle read error (giving up after %d consecutive failures): %s", consecutive_errors, e)
+                    log.error(
+                        "Dongle read error (giving up after %d consecutive failures): %s",
+                        consecutive_errors,
+                        e,
+                    )
                     self._handle_dongle_disconnect()
                     return
                 log.warning("Dongle read glitch (%d/%d): %s", consecutive_errors, max_retries, e)
@@ -258,12 +259,16 @@ class MuxDaemon:
                 return None
             if config_bytes == self.locked_config:
                 # Same config — reply Ok without hitting the dongle
-                log.debug("%s: SetConfig matches locked config — Ok",
-                          client.label if client else f"id-{client_id}")
+                log.debug(
+                    "%s: SetConfig matches locked config — Ok",
+                    client.label if client else f"id-{client_id}",
+                )
                 return bytes([TAG_OK])
             # Different config — reject
-            log.warning("%s: SetConfig rejected (conflicts with locked config)",
-                        client.label if client else f"id-{client_id}")
+            log.warning(
+                "%s: SetConfig rejected (conflicts with locked config)",
+                client.label if client else f"id-{client_id}",
+            )
             return bytes([TAG_ERROR, ERROR_INVALID_CONFIG])
 
         if cmd_tag == CMD_TAG_START_RX:
@@ -294,7 +299,9 @@ class MuxDaemon:
 
     # ── Client handling ──────────────────────────────────────────
 
-    async def client_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def client_handler(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         client = Client(reader, writer)
         self.clients[client.id] = client
         client.start_sender()
@@ -311,7 +318,7 @@ class MuxDaemon:
                 while b"\x00" in buf:
                     idx = buf.index(b"\x00")
                     encoded = buf[:idx]
-                    buf = buf[idx + 1:]
+                    buf = buf[idx + 1 :]
                     if not encoded:
                         continue
                     try:
@@ -338,10 +345,9 @@ class MuxDaemon:
             await self.cmd_queue.put((-1, bytes([CMD_TAG_STOP_RX])))
 
         # Reset locked config when all clients are gone
-        if not self.clients:
-            if self.locked_config is not None:
-                log.info("All clients gone — config lock released")
-                self.locked_config = None
+        if not self.clients and self.locked_config is not None:
+            log.info("All clients gone — config lock released")
+            self.locked_config = None
 
     # ── Dongle disconnect ────────────────────────────────────────
 
@@ -352,10 +358,8 @@ class MuxDaemon:
         if self.pending_response and not self.pending_response.done():
             self.pending_response.set_result(bytes([5, 1]))  # Error(RadioBusy)
         if self.ser:
-            try:
+            with contextlib.suppress(Exception):
                 self.ser.close()
-            except Exception:
-                pass
             self.ser = None
         self._dongle_lost.set()
 
@@ -398,7 +402,9 @@ class MuxDaemon:
         tcp_server = None
         if self.tcp_addr:
             tcp_server = await asyncio.start_server(
-                self.client_handler, self.tcp_addr[0], self.tcp_addr[1],
+                self.client_handler,
+                self.tcp_addr[0],
+                self.tcp_addr[1],
             )
             log.info("TCP listening on %s:%d", *self.tcp_addr)
 
@@ -433,10 +439,8 @@ class MuxDaemon:
                 # Tear down dongle tasks
                 reader_task.cancel()
                 writer_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.gather(reader_task, writer_task, return_exceptions=True)
-                except asyncio.CancelledError:
-                    pass
 
                 # Drain any pending commands with errors
                 while not self.cmd_queue.empty():
@@ -467,12 +471,18 @@ class MuxDaemon:
 
 # ── CLI ──────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DongLoRa USB Multiplexer")
     parser.add_argument("--port", "-p", default=None, help="Serial port (auto-detect if omitted)")
     parser.add_argument("--socket", "-s", default=None, help="Unix socket path")
-    parser.add_argument("--tcp", "-t", default="0.0.0.0:5741", metavar="[HOST:]PORT",
-                        help="TCP listen address (default: 0.0.0.0:5741, 'none' to disable)")
+    parser.add_argument(
+        "--tcp",
+        "-t",
+        default="0.0.0.0:5741",
+        metavar="[HOST:]PORT",
+        help="TCP listen address (default: 0.0.0.0:5741, 'none' to disable)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
