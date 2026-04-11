@@ -43,6 +43,10 @@ CMD_TAG_STOP_RX = 4
 
 ERROR_INVALID_CONFIG = 0
 
+# Keepalive: ping every 5s of idle, declare lost after 2s timeout
+KEEPALIVE_INTERVAL = 5.0
+KEEPALIVE_TIMEOUT = 2.0
+
 
 def default_socket_path() -> str:
     """Resolve the mux socket path in priority order."""
@@ -179,12 +183,41 @@ class MuxDaemon:
 
     # ── Dongle writer task ───────────────────────────────────────
 
+    async def _keepalive_ping(self) -> bool:
+        """Send a Ping and wait for Pong. Returns True if dongle responded."""
+        loop = asyncio.get_running_loop()
+        self.pending_response = loop.create_future()
+
+        try:
+            ping_frame = dl.cobs_encode(dl.encode_command("Ping"))
+            await asyncio.to_thread(self._serial_write, ping_frame)
+        except (serial.SerialException, OSError):
+            self.pending_response = None
+            return False
+
+        try:
+            await asyncio.wait_for(self.pending_response, timeout=KEEPALIVE_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            self.pending_response = None
+            return False
+
     async def dongle_writer(self) -> None:
         """Pull commands from queue, send one at a time, route responses."""
         loop = asyncio.get_running_loop()
 
         while not self._shutdown.is_set():
-            client_id, raw_cmd = await self.cmd_queue.get()
+            try:
+                client_id, raw_cmd = await asyncio.wait_for(
+                    self.cmd_queue.get(), timeout=KEEPALIVE_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                log.debug("keepalive ping")
+                if not await self._keepalive_ping():
+                    log.error("Keepalive ping failed - dongle lost")
+                    self._handle_dongle_disconnect()
+                    return
+                continue
 
             # Check for StartRx/StopRx ref-counting intercept
             intercepted = await self._maybe_intercept(client_id, raw_cmd)
@@ -368,7 +401,7 @@ class MuxDaemon:
     def _open_dongle(self) -> bool:
         """Open and ping the dongle. Returns True on success."""
         try:
-            self.ser = serial.Serial(self.serial_port, timeout=2.0, exclusive=True)
+            self.ser = serial.Serial(self.serial_port, 115200, timeout=2.0, exclusive=True)
             self.ser.reset_input_buffer()
             self._serial_write(dl.cobs_encode(dl.encode_command("Ping")))
             pong = self._serial_read_frame()
@@ -409,6 +442,9 @@ class MuxDaemon:
             log.info("TCP listening on %s:%d", *self.tcp_addr)
 
         # Connect/reconnect loop — servers stay up, dongle comes and goes
+        saved_config: bytes | None = None
+        had_rx_interest = False
+
         try:
             while not self._shutdown.is_set():
                 # Connect to dongle (retry until it appears)
@@ -425,6 +461,15 @@ class MuxDaemon:
                 self._dongle_lost.clear()
                 reader_task = asyncio.create_task(self.dongle_reader(), name="dongle-reader")
                 writer_task = asyncio.create_task(self.dongle_writer(), name="dongle-writer")
+
+                # Re-establish radio state from previous session
+                if saved_config is not None:
+                    log.info("Restoring radio config after reconnect")
+                    await self.cmd_queue.put((-1, bytes([CMD_TAG_SET_CONFIG]) + saved_config))
+                    if had_rx_interest:
+                        await self.cmd_queue.put((-1, bytes([CMD_TAG_START_RX])))
+                    saved_config = None
+                    had_rx_interest = False
 
                 # Wait for dongle loss or shutdown
                 shutdown_task = asyncio.create_task(self._shutdown.wait())
@@ -448,6 +493,11 @@ class MuxDaemon:
                         self.cmd_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+
+                # Save radio state for restoration after reconnect
+                saved_config = self.locked_config
+                had_rx_interest = self._rx_interest_count() > 0
+                self.locked_config = None
 
                 if not self._shutdown.is_set():
                     log.info("Reconnecting in 2 seconds...")
