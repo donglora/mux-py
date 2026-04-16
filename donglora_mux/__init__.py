@@ -62,6 +62,10 @@ def default_socket_path() -> str:
 # ── Per-client state ─────────────────────────────────────────────
 
 
+DROP_LOG_EVERY = 32
+"""Warn every Nth dropped frame per client instead of every drop (noise budget)."""
+
+
 class Client:
     """Tracks one connected client."""
 
@@ -75,6 +79,8 @@ class Client:
         self.rx_interested = False  # has this client called StartRx?
         self.send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
         self._sender_task: asyncio.Task | None = None
+        self.drops = 0  # running total of frames dropped due to full queue
+        self.exit_reason: str | None = None  # set when reader task exits
 
     @property
     def label(self) -> str:
@@ -90,11 +96,13 @@ class Client:
                 frame = await self.send_queue.get()
                 self.writer.write(frame)
                 await self.writer.drain()
-        except (ConnectionError, asyncio.CancelledError):
+        except asyncio.CancelledError:
             pass
+        except (ConnectionError, OSError) as e:
+            log.debug("%s writer exit: %s (%s)", self.label, e, type(e).__name__)
 
     async def enqueue(self, cobs_frame: bytes) -> None:
-        """Enqueue a COBS frame for sending.  Drops oldest RxPacket on overflow."""
+        """Enqueue a COBS frame for sending.  Drops oldest on overflow."""
         try:
             self.send_queue.put_nowait(cobs_frame)
         except asyncio.QueueFull:
@@ -103,6 +111,9 @@ class Client:
                 self.send_queue.get_nowait()
             with contextlib.suppress(asyncio.QueueFull):
                 self.send_queue.put_nowait(cobs_frame)
+            self.drops += 1
+            if self.drops == 1 or self.drops % DROP_LOG_EVERY == 0:
+                log.warning("%s: send queue full, dropped %d frames so far", self.label, self.drops)
 
     def close(self) -> None:
         if self._sender_task:
@@ -345,6 +356,7 @@ class MuxDaemon:
             while True:
                 data = await reader.read(4096)
                 if not data:
+                    client.exit_reason = "EOF (peer closed)"
                     break
                 buf += data
                 # Extract complete COBS frames (delimited by 0x00)
@@ -360,8 +372,10 @@ class MuxDaemon:
                         log.warning("%s: bad COBS frame — skipped", client.label)
                         continue
                     await self.cmd_queue.put((client.id, raw_cmd))
-        except (ConnectionError, asyncio.CancelledError):
-            pass
+        except asyncio.CancelledError:
+            client.exit_reason = "cancelled (mux shutdown)"
+        except (ConnectionError, OSError) as e:
+            client.exit_reason = f"read error: {e} ({type(e).__name__})"
         finally:
             await self._remove_client(client)
 
@@ -370,7 +384,17 @@ class MuxDaemon:
         was_interested = client.rx_interested
         client.close()
         self.clients.pop(client.id, None)
-        log.info("%s disconnected (%d remain)", client.label, len(self.clients))
+        reason = client.exit_reason or "unknown"
+        if client.drops > 0:
+            log.info(
+                "%s disconnected (%d remain, %d dropped frames, reason=%s)",
+                client.label,
+                len(self.clients),
+                client.drops,
+                reason,
+            )
+        else:
+            log.info("%s disconnected (%d remain, reason=%s)", client.label, len(self.clients), reason)
 
         # If this client had RX interest and was the last one, stop RX
         if was_interested and self._rx_interest_count() == 0:
