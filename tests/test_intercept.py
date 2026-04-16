@@ -1,158 +1,194 @@
-"""Tests for mux interception logic — ported from mux-rs/src/intercept.rs tests."""
+"""Unit tests for :mod:`donglora_mux.intercept`.
+
+Ports the ``intercept`` test cases from ``mux-rs/src/intercept.rs``,
+adapted for Python / asyncio.
+"""
 
 from __future__ import annotations
 
-import asyncio
+import pytest
 
-from donglora.protocol import RADIO_CONFIG_SIZE
-from donglora_mux import (
-    CMD_TAG_SET_CONFIG,
-    CMD_TAG_START_RX,
-    CMD_TAG_STOP_RX,
-    ERROR_INVALID_CONFIG,
-    TAG_ERROR,
-    TAG_OK,
-    Client,
-    MuxDaemon,
+from donglora.commands import (
+    TYPE_GET_INFO,
+    TYPE_PING,
+    TYPE_RX_START,
+    TYPE_RX_STOP,
+    TYPE_SET_CONFIG,
+    encode_set_config_payload,
 )
+from donglora.events import TYPE_OK, Owner, SetConfigResult, SetConfigResultCode
+from donglora.modulation import LoRaBandwidth, LoRaCodingRate, LoRaConfig
+from donglora_mux.intercept import DecisionKind, MuxState, decide
+from donglora_mux.session import ClientSession
 
 
-def _make_daemon() -> MuxDaemon:
-    """Create a MuxDaemon with no real serial port (for interception tests only)."""
-    daemon = MuxDaemon.__new__(MuxDaemon)
-    daemon.serial_port = "/dev/null"
-    daemon.socket_path = "/tmp/test-mux.sock"
-    daemon.tcp_addr = None
-    daemon.ser = None
-    daemon.clients = {}
-    daemon.cmd_queue = asyncio.Queue()
-    daemon.pending_response = None
-    daemon.locked_config = None
-    daemon._shutdown = asyncio.Event()
-    return daemon
+def _lora(freq_hz: int = 910_525_000) -> LoRaConfig:
+    return LoRaConfig(
+        freq_hz=freq_hz,
+        sf=7,
+        bw=LoRaBandwidth.KHZ_62_5,
+        cr=LoRaCodingRate.CR_4_5,
+        preamble_len=16,
+        sync_word=0x1424,
+        tx_power_dbm=20,
+    )
 
 
-def _make_client(daemon: MuxDaemon) -> Client:
-    """Add a mock client to the daemon and return it."""
-    reader = asyncio.StreamReader()
-    # We can't easily create a StreamWriter without a transport, so we'll
-    # test the interception logic directly via _maybe_intercept
-    client = Client.__new__(Client)
-    client.id = Client._next_id
-    Client._next_id += 1
-    client.reader = reader
-    client.writer = None  # type: ignore[assignment]
-    client.rx_interested = False
-    client.send_queue = asyncio.Queue(maxsize=256)
-    client._sender_task = None
-    daemon.clients[client.id] = client
-    return client
+def _make_sessions(n: int) -> dict[int, ClientSession]:
+    return {s.id: s for s in (ClientSession() for _ in range(n))}
 
 
-class TestSetConfigIntercept:
-    def test_single_client_forwards(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        cmd = bytes([CMD_TAG_SET_CONFIG]) + bytes(RADIO_CONFIG_SIZE)
-        result = asyncio.get_event_loop().run_until_complete(daemon._maybe_intercept(c1.id, cmd))
-        assert result is None  # should forward to dongle
-
-    def test_first_with_multiple_forwards(self) -> None:
-        daemon = _make_daemon()
-        _make_client(daemon)
-        c2 = _make_client(daemon)
-        cmd = bytes([CMD_TAG_SET_CONFIG]) + bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
-        result = asyncio.get_event_loop().run_until_complete(daemon._maybe_intercept(c2.id, cmd))
-        assert result is None  # no locked config yet, forward
-
-    def test_matching_returns_ok(self) -> None:
-        daemon = _make_daemon()
-        _make_client(daemon)
-        c2 = _make_client(daemon)
-        config_bytes = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
-        daemon.locked_config = config_bytes
-        cmd = bytes([CMD_TAG_SET_CONFIG]) + config_bytes
-        result = asyncio.get_event_loop().run_until_complete(daemon._maybe_intercept(c2.id, cmd))
-        assert result == bytes([TAG_OK])
-
-    def test_conflicting_returns_error(self) -> None:
-        daemon = _make_daemon()
-        _make_client(daemon)
-        c2 = _make_client(daemon)
-        daemon.locked_config = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
-        cmd = bytes([CMD_TAG_SET_CONFIG]) + bytes([99, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
-        result = asyncio.get_event_loop().run_until_complete(daemon._maybe_intercept(c2.id, cmd))
-        assert result == bytes([TAG_ERROR, ERROR_INVALID_CONFIG])
+def _first_id(sessions: dict[int, ClientSession]) -> int:
+    return min(sessions.keys())
 
 
-class TestStartRxIntercept:
-    def test_first_client_forwards(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        result = asyncio.get_event_loop().run_until_complete(
-            daemon._maybe_intercept(c1.id, bytes([CMD_TAG_START_RX]))
-        )
-        assert result is None  # first interested client, forward
-
-    def test_already_interested_returns_ok(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        c1.rx_interested = True
-        result = asyncio.get_event_loop().run_until_complete(
-            daemon._maybe_intercept(c1.id, bytes([CMD_TAG_START_RX]))
-        )
-        assert result == bytes([TAG_OK])
-
-    def test_others_interested_marks_and_returns_ok(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        c2 = _make_client(daemon)
-        c1.rx_interested = True
-        result = asyncio.get_event_loop().run_until_complete(
-            daemon._maybe_intercept(c2.id, bytes([CMD_TAG_START_RX]))
-        )
-        assert result == bytes([TAG_OK])
-        assert c2.rx_interested is True
+def _second_id(sessions: dict[int, ClientSession]) -> int:
+    ids = sorted(sessions.keys())
+    return ids[1]
 
 
-class TestStopRxIntercept:
-    def test_not_interested_returns_ok(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        result = asyncio.get_event_loop().run_until_complete(
-            daemon._maybe_intercept(c1.id, bytes([CMD_TAG_STOP_RX]))
-        )
-        assert result == bytes([TAG_OK])
-
-    def test_others_remain_returns_ok(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        c2 = _make_client(daemon)
-        c1.rx_interested = True
-        c2.rx_interested = True
-        result = asyncio.get_event_loop().run_until_complete(
-            daemon._maybe_intercept(c1.id, bytes([CMD_TAG_STOP_RX]))
-        )
-        assert result == bytes([TAG_OK])
-        assert c1.rx_interested is False
-
-    def test_last_interested_forwards(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        c1.rx_interested = True
-        result = asyncio.get_event_loop().run_until_complete(
-            daemon._maybe_intercept(c1.id, bytes([CMD_TAG_STOP_RX]))
-        )
-        assert result is None  # last client, forward to dongle
-        assert c1.rx_interested is False
+# ── SET_CONFIG ─────────────────────────────────────────────────────
 
 
-class TestOtherCommands:
-    def test_not_intercepted(self) -> None:
-        daemon = _make_daemon()
-        c1 = _make_client(daemon)
-        for tag in [0, 1, 5, 6, 7, 8]:
-            result = asyncio.get_event_loop().run_until_complete(
-                daemon._maybe_intercept(c1.id, bytes([tag]))
-            )
-            assert result is None
+def test_set_config_single_client_forwards():
+    sessions = _make_sessions(1)
+    state = MuxState()
+    cid = _first_id(sessions)
+    payload = encode_set_config_payload(_lora())
+    d = decide(TYPE_SET_CONFIG, payload, cid, state, sessions)
+    assert d.kind == DecisionKind.FORWARD
+
+
+def test_set_config_first_multi_client_forwards():
+    sessions = _make_sessions(2)
+    state = MuxState()
+    cid = _first_id(sessions)
+    payload = encode_set_config_payload(_lora())
+    d = decide(TYPE_SET_CONFIG, payload, cid, state, sessions)
+    assert d.kind == DecisionKind.FORWARD
+
+
+def test_set_config_matching_synthesizes_already_matched():
+    sessions = _make_sessions(2)
+    id_a = _first_id(sessions)
+    id_b = _second_id(sessions)
+    state = MuxState()
+    state.locked = (id_a, _lora())
+    payload = encode_set_config_payload(_lora())
+    d = decide(TYPE_SET_CONFIG, payload, id_b, state, sessions)
+    assert d.kind == DecisionKind.SYNTHESIZE
+    assert d.type_id == TYPE_OK
+    result = SetConfigResult.decode(d.payload)
+    assert result.result == SetConfigResultCode.ALREADY_MATCHED
+    assert result.owner == Owner.OTHER
+
+
+def test_set_config_conflict_synthesizes_locked_mismatch_with_current_echoed():
+    sessions = _make_sessions(2)
+    id_a = _first_id(sessions)
+    id_b = _second_id(sessions)
+    state = MuxState()
+    # A's lock is 910.525 MHz; B requests 915 MHz.
+    state.locked = (id_a, _lora(910_525_000))
+    payload = encode_set_config_payload(_lora(915_000_000))
+    d = decide(TYPE_SET_CONFIG, payload, id_b, state, sessions)
+    assert d.kind == DecisionKind.SYNTHESIZE
+    result = SetConfigResult.decode(d.payload)
+    assert result.result == SetConfigResultCode.LOCKED_MISMATCH
+    assert result.owner == Owner.OTHER
+    # The echoed `current` must reflect A's locked modulation, not B's request.
+    assert isinstance(result.current, LoRaConfig)
+    assert result.current.freq_hz == 910_525_000
+
+
+def test_set_config_owner_reconfig_forwards():
+    sessions = _make_sessions(2)
+    id_a = _first_id(sessions)
+    state = MuxState()
+    state.locked = (id_a, _lora(910_525_000))
+    # A re-tunes — should forward, daemon updates lock on APPLIED.
+    payload = encode_set_config_payload(_lora(915_000_000))
+    d = decide(TYPE_SET_CONFIG, payload, id_a, state, sessions)
+    assert d.kind == DecisionKind.FORWARD
+
+
+# ── RX_START ───────────────────────────────────────────────────────
+
+
+def test_rx_start_first_forwards():
+    sessions = _make_sessions(1)
+    state = MuxState()
+    cid = _first_id(sessions)
+    d = decide(TYPE_RX_START, b"", cid, state, sessions)
+    assert d.kind == DecisionKind.FORWARD
+
+
+def test_rx_start_when_others_listening_marks_and_synthesizes_ok():
+    sessions = _make_sessions(2)
+    state = MuxState()
+    id_a = _first_id(sessions)
+    id_b = _second_id(sessions)
+    sessions[id_a].rx_interested = True
+    d = decide(TYPE_RX_START, b"", id_b, state, sessions)
+    assert d.kind == DecisionKind.SYNTHESIZE
+    assert d.type_id == TYPE_OK
+    assert d.payload == b""
+    assert sessions[id_b].rx_interested is True
+
+
+def test_rx_start_already_interested_synthesizes_ok():
+    sessions = _make_sessions(1)
+    state = MuxState()
+    cid = _first_id(sessions)
+    sessions[cid].rx_interested = True
+    d = decide(TYPE_RX_START, b"", cid, state, sessions)
+    assert d.kind == DecisionKind.SYNTHESIZE
+    assert d.type_id == TYPE_OK
+
+
+# ── RX_STOP ────────────────────────────────────────────────────────
+
+
+def test_rx_stop_not_interested_synthesizes_ok():
+    sessions = _make_sessions(1)
+    state = MuxState()
+    cid = _first_id(sessions)
+    d = decide(TYPE_RX_STOP, b"", cid, state, sessions)
+    assert d.kind == DecisionKind.SYNTHESIZE
+    assert d.type_id == TYPE_OK
+
+
+def test_rx_stop_with_others_listening_clears_caller_and_synthesizes_ok():
+    sessions = _make_sessions(2)
+    state = MuxState()
+    id_a = _first_id(sessions)
+    id_b = _second_id(sessions)
+    sessions[id_a].rx_interested = True
+    sessions[id_b].rx_interested = True
+    d = decide(TYPE_RX_STOP, b"", id_a, state, sessions)
+    assert d.kind == DecisionKind.SYNTHESIZE
+    assert d.type_id == TYPE_OK
+    assert sessions[id_a].rx_interested is False
+    assert sessions[id_b].rx_interested is True
+
+
+def test_rx_stop_last_interested_forwards_and_clears():
+    sessions = _make_sessions(1)
+    state = MuxState()
+    cid = _first_id(sessions)
+    sessions[cid].rx_interested = True
+    d = decide(TYPE_RX_STOP, b"", cid, state, sessions)
+    assert d.kind == DecisionKind.FORWARD
+    assert sessions[cid].rx_interested is False
+
+
+# ── Other commands ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("type_id", [TYPE_PING, TYPE_GET_INFO])
+def test_other_commands_forward(type_id):
+    sessions = _make_sessions(1)
+    state = MuxState()
+    cid = _first_id(sessions)
+    d = decide(type_id, b"", cid, state, sessions)
+    assert d.kind == DecisionKind.FORWARD

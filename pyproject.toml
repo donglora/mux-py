@@ -1,6 +1,6 @@
 [project]
 name = "donglora-mux"
-version = "0.2.0"
+version = "1.0.0"
 description = "DongLoRa USB Multiplexer — share one dongle with multiple applications"
 license = "MIT"
 requires-python = ">=3.10"
@@ -8,16 +8,18 @@ readme = "README.md"
 authors = [{ name = "Stephen Waits", email = "steve@waits.net" }]
 keywords = ["lora", "radio", "usb", "multiplexer"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Communications :: Ham Radio",
     "Topic :: System :: Hardware",
 ]
 dependencies = [
-    "donglora",
-    "cobs",
-    "pyserial",
+    # DongLoRa Protocol v2 wire primitives — encode_frame, decode_frame, Command/DeviceMessage
+    # parsers, SetConfigResult, RxEvent, etc. Pinned tightly; the mux knows
+    # intimate details about the v1.0 shape and will break if the protocol
+    # moves.
+    "donglora>=1.0.0,<2.0.0",
 ]
 
 [project.scripts]
@@ -28,7 +30,7 @@ Repository = "https://github.com/donglora/mux-py"
 Homepage = "https://github.com/donglora/mux-py"
 
 [dependency-groups]
-dev = ["ruff", "pytest", "pytest-cov"]
+dev = ["ruff", "pytest", "pytest-cov", "pytest-asyncio"]
 
 [build-system]
 requires = ["hatchling"]
@@ -50,3 +52,4 @@ known-first-party = ["donglora", "donglora_mux"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
